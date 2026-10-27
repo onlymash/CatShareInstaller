@@ -1,0 +1,235 @@
+#!/sbin/sh
+
+OUTFD="/proc/self/fd/$2"
+ZIP="$3"
+
+set_con() {
+  chcon -h u:object_r:"$1":s0 "$2" 2>/dev/null || true
+  chcon u:object_r:"$1":s0 "$2" 2>/dev/null || true
+}
+
+set_perm() {
+  chmod "$1" "$2"
+}
+
+set_owner() {
+  chown "$1":"$2" "$3"
+}
+
+ui_print() {
+  echo "ui_print $1" > "$OUTFD"
+  echo "ui_print" > "$OUTFD"
+}
+
+getprop2() {
+  grep -m 1 "^$2=" "$1" 2>/dev/null | cut -d= -f2
+}
+
+cleanup() {
+  ui_print "Cleaning up temporary files..."
+  rm -rf "$TMP/system"
+  rm -rf "$TMP/bin"
+  rm -f "$TMP/toybox"
+  rm -f "$TMP/build.prop"
+
+  ui_print "Unmounting partitions..."
+  umount -l "$SYSTEM_MNT" 2>/dev/null || true
+  umount -l /product 2>/dev/null || true
+  umount -l /system_ext 2>/dev/null || true
+}
+
+error() {
+  ui_print "$1"
+  cleanup
+  exit 1
+}
+
+error_no_space() {
+  error "Not enough storage space! Aborting"
+}
+
+error_mounting() {
+  error "Could not mount $1! Aborting"
+}
+
+get_block_for_mount_point() {
+  grep -v "^#" /etc/recovery.fstab 2>/dev/null | grep "[[:blank:]]$1[[:blank:]]" | tail -n1 | tr -s [:blank:] ' ' | cut -d' ' -f1
+}
+
+find_block() {
+  local name="$1"
+  local fstab_entry=$(get_block_for_mount_point "/$name")
+  # System-as-root fallbacks
+  [ -z "$fstab_entry" ] && [ "$name" = "system" ] && fstab_entry=$(get_block_for_mount_point "/")
+  [ -z "$fstab_entry" ] && [ "$name" = "system" ] && fstab_entry=$(get_block_for_mount_point "/system_root")
+
+  local dev
+  if [ "$DYNAMIC_PARTITIONS" = "true" ]; then
+    if [ -n "$fstab_entry" ]; then
+      dev="${BLK_PATH}/${fstab_entry}${SLOT_SUFFIX}"
+    else
+      dev="${BLK_PATH}/${name}${SLOT_SUFFIX}"
+    fi
+  else
+    if [ -n "$fstab_entry" ]; then
+      dev="${fstab_entry}${SLOT_SUFFIX}"
+    else
+      dev="${BLK_PATH}/${name}${SLOT_SUFFIX}"
+    fi
+  fi
+
+  if [ -b "$dev" ]; then
+    echo "$dev"
+  fi
+}
+
+ui_print "************************************"
+ui_print "*   CatShare System App Installer  *"
+ui_print "*      with LineageOS addon.d      *"
+ui_print "************************************"
+
+ui_print "Extracting installer files..."
+TMP=/tmp
+cd "$TMP"
+unzip -o "$ZIP"
+rm -rf META-INF
+
+ui_print "Setting up environment..."
+TOYBOX="${TMP}/toybox"
+if [ -f "$TOYBOX" ]; then
+  chmod +x "$TOYBOX"
+  TOYS_PATH="${TMP}/bin"
+  rm -rf "$TOYS_PATH"
+  $TOYBOX install -d "$TOYS_PATH" 2>/dev/null || mkdir -p "$TOYS_PATH"
+  for toy in $($TOYBOX 2>/dev/null); do
+    $TOYBOX ln -sf "$TOYBOX" "${TOYS_PATH}/${toy}" 2>/dev/null
+  done
+  PATH="${TOYS_PATH}:${PATH}"
+fi
+
+ui_print "Mounting partitions..."
+
+# Ensure system is unmounted first
+umount /system 2>/dev/null || umount /mnt/system 2>/dev/null || true
+umount /product 2>/dev/null || true
+umount /system_ext 2>/dev/null || true
+
+# Find partitions
+DYNAMIC_PARTITIONS=$(getprop ro.boot.dynamic_partitions)
+if [ "$DYNAMIC_PARTITIONS" = "true" ]; then
+    BLK_PATH="/dev/block/mapper"
+else
+    BLK_PATH=/dev/block/bootdevice/by-name
+fi
+
+CURRENTSLOT=$(getprop ro.boot.slot_suffix)
+if [ -n "$CURRENTSLOT" ]; then
+  if [ "$CURRENTSLOT" = "_a" ]; then
+    SLOT_SUFFIX="_a"
+  else
+    SLOT_SUFFIX="_b"
+  fi
+fi
+
+SYSTEM_BLOCK=$(find_block "system")
+PRODUCT_BLOCK=$(find_block "product")
+SYSTEM_EXT_BLOCK=$(find_block "system_ext")
+
+# Disable rw protection on dynamic partitions
+if [ "$DYNAMIC_PARTITIONS" = "true" ]; then
+  [ -n "$SYSTEM_BLOCK" ] && blockdev --setrw "$SYSTEM_BLOCK" 2>/dev/null || true
+  [ -n "$PRODUCT_BLOCK" ] && blockdev --setrw "$PRODUCT_BLOCK" 2>/dev/null || true
+  [ -n "$SYSTEM_EXT_BLOCK" ] && blockdev --setrw "$SYSTEM_EXT_BLOCK" 2>/dev/null || true
+fi
+
+# Mount and define SYSTEM_OUT
+SYSTEM_MNT=/mnt/system
+mkdir -p "$SYSTEM_MNT" 2>/dev/null || true
+if mount -o rw "$SYSTEM_BLOCK" "$SYSTEM_MNT"; then
+  ui_print "Mounted system: $SYSTEM_MNT"
+else
+  error_mounting "$SYSTEM_MNT"
+fi
+
+if [ -d "${SYSTEM_MNT}/system" ]; then
+  SYSTEM_OUT="${SYSTEM_MNT}/system"
+else
+  SYSTEM_OUT="${SYSTEM_MNT}"
+fi
+
+# Ignore product block device if it is a symlink inside system
+if [ -L "${SYSTEM_MNT}/product" ] || [ -L "${SYSTEM_OUT}/product" ]; then
+  PRODUCT_BLOCK=""
+fi
+
+if [ -n "$PRODUCT_BLOCK" ]; then
+  mkdir /product 2>/dev/null || true
+  if mount -o rw "$PRODUCT_BLOCK" /product; then
+    ui_print "Mounted standalone /product"
+  else
+    ui_print "Notice: Falling back to system/product directory"
+    PRODUCT_BLOCK=""
+  fi
+fi
+
+# Storage space check (need ~15MB)
+STORAGE_BUFFER=15360
+if [ -n "$PRODUCT_BLOCK" ]; then
+  PRODUCT_STORAGE=$(df /product 2>/dev/null | tail -1 | tr -s ' ' | cut -d ' ' -f4)
+  if [ -n "$PRODUCT_STORAGE" ] && [ "$PRODUCT_STORAGE" -lt "$STORAGE_BUFFER" ]; then
+    error_no_space
+  fi
+else
+  SYSTEM_STORAGE=$(df "$SYSTEM_MNT" 2>/dev/null | tail -1 | tr -s ' ' | cut -d ' ' -f4)
+  if [ -n "$SYSTEM_STORAGE" ] && [ "$SYSTEM_STORAGE" -lt "$STORAGE_BUFFER" ]; then
+    error_no_space
+  fi
+fi
+
+cd system
+
+ui_print "Generating addon.d survival script..."
+cat addon.d/addond_head > addon.d/70-catshare.sh
+for f in $(find . ! -path "./addon.d/*" -type f); do
+  line=$(echo "$f" | sed 's/\.\///')
+  echo "$line" >> addon.d/70-catshare.sh
+done
+cat addon.d/addond_tail >> addon.d/70-catshare.sh
+rm -f addon.d/addond_head addon.d/addond_tail
+
+ui_print "Removing old CatShare instances..."
+rm -rf "${SYSTEM_OUT}/product/priv-app/CatShare"
+rm -rf "${SYSTEM_OUT}/priv-app/CatShare"
+rm -f "${SYSTEM_OUT}/product/etc/permissions/privapp-permissions-catshare.xml"
+rm -f "${SYSTEM_OUT}/etc/permissions/privapp-permissions-catshare.xml"
+if [ -n "$PRODUCT_BLOCK" ]; then
+  rm -rf "/product/priv-app/CatShare"
+  rm -f "/product/etc/permissions/privapp-permissions-catshare.xml"
+fi
+
+ui_print "Preparing permissions..."
+for d in $(find . -mindepth 1 -type d); do
+  set_perm 0755 "$d"
+  set_owner root root "$d"
+done
+for f in $(find . -type f); do
+  type=$(echo "$f" | sed 's/.*\.//')
+  if [ "$type" = "sh" ] || [ "$type" = "$f" ]; then
+    set_perm 0755 "$f"
+  else
+    set_perm 0644 "$f"
+  fi
+  set_owner root root "$f"
+  set_con system_file "$f"
+done
+
+ui_print "Copying CatShare files..."
+cp --preserve=a -r ./* "${SYSTEM_OUT}/"
+if [ -n "$PRODUCT_BLOCK" ]; then
+  cp --preserve=a -r ./product/* /product/
+fi
+
+cleanup
+
+ui_print "CatShare installed successfully!"
+exit 0

@@ -1,0 +1,16 @@
+# Output Archives
+*.zip
+
+# Android Packages
+*.apk
+
+# Temporary Build Dirs
+.build_tmp/
+build_package/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+
+# Reference GApps Directory (to be removed)
+MindTheGapps*
