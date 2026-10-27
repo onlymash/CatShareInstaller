@@ -33,9 +33,8 @@ cleanup() {
   rm -f "$TMP/build.prop"
 
   ui_print "Unmounting partitions..."
+  umount -l /mnt/product 2>/dev/null || true
   umount -l "$SYSTEM_MNT" 2>/dev/null || true
-  umount -l /product 2>/dev/null || true
-  umount -l /system_ext 2>/dev/null || true
 }
 
 error() {
@@ -46,10 +45,6 @@ error() {
 
 error_no_space() {
   error "Not enough storage space! Aborting"
-}
-
-error_mounting() {
-  error "Could not mount $1! Aborting"
 }
 
 get_block_for_mount_point() {
@@ -109,12 +104,9 @@ fi
 
 ui_print "Mounting partitions..."
 
-# Ensure system is unmounted first
+umount /mnt/product 2>/dev/null || true
 umount /system 2>/dev/null || umount /mnt/system 2>/dev/null || true
-umount /product 2>/dev/null || true
-umount /system_ext 2>/dev/null || true
 
-# Find partitions
 DYNAMIC_PARTITIONS=$(getprop ro.boot.dynamic_partitions)
 if [ "$DYNAMIC_PARTITIONS" = "true" ]; then
     BLK_PATH="/dev/block/mapper"
@@ -133,49 +125,46 @@ fi
 
 SYSTEM_BLOCK=$(find_block "system")
 PRODUCT_BLOCK=$(find_block "product")
-SYSTEM_EXT_BLOCK=$(find_block "system_ext")
 
 # Disable rw protection on dynamic partitions
 if [ "$DYNAMIC_PARTITIONS" = "true" ]; then
-  [ -n "$SYSTEM_BLOCK" ] && blockdev --setrw "$SYSTEM_BLOCK" 2>/dev/null || true
+  [ -n "$SYSTEM_BLOCK" ]  && blockdev --setrw "$SYSTEM_BLOCK"  2>/dev/null || true
   [ -n "$PRODUCT_BLOCK" ] && blockdev --setrw "$PRODUCT_BLOCK" 2>/dev/null || true
-  [ -n "$SYSTEM_EXT_BLOCK" ] && blockdev --setrw "$SYSTEM_EXT_BLOCK" 2>/dev/null || true
 fi
 
-# Mount and define SYSTEM_OUT
+# Mount system
 SYSTEM_MNT=/mnt/system
 mkdir -p "$SYSTEM_MNT" 2>/dev/null || true
 if mount -o rw "$SYSTEM_BLOCK" "$SYSTEM_MNT"; then
-  ui_print "Mounted system: $SYSTEM_MNT"
+  ui_print "Mounted: $SYSTEM_MNT"
 else
-  error_mounting "$SYSTEM_MNT"
+  error "Could not mount system! Aborting"
 fi
 
+# Detect system-as-root layout
 if [ -d "${SYSTEM_MNT}/system" ]; then
   SYSTEM_OUT="${SYSTEM_MNT}/system"
 else
   SYSTEM_OUT="${SYSTEM_MNT}"
 fi
 
-# Ignore product block device if it is a symlink inside system
-if [ -L "${SYSTEM_MNT}/product" ] || [ -L "${SYSTEM_OUT}/product" ]; then
-  PRODUCT_BLOCK=""
-fi
-
+# Mount product partition separately (even if it appears as a symlink inside system).
+# We always mount to /mnt/product to get a writable handle, regardless of symlinks.
+PRODUCT_MNT=""
 if [ -n "$PRODUCT_BLOCK" ]; then
-  mkdir /product 2>/dev/null || true
-  if mount -o rw "$PRODUCT_BLOCK" /product; then
-    ui_print "Mounted standalone /product"
+  mkdir -p /mnt/product 2>/dev/null || true
+  if mount -o rw "$PRODUCT_BLOCK" /mnt/product; then
+    ui_print "Mounted product: /mnt/product"
+    PRODUCT_MNT=/mnt/product
   else
-    ui_print "Notice: Falling back to system/product directory"
-    PRODUCT_BLOCK=""
+    ui_print "Warning: Could not mount product partition, falling back to system/product"
   fi
 fi
 
-# Storage space check (need ~15MB)
+# Storage space check (need ~15 MB)
 STORAGE_BUFFER=15360
-if [ -n "$PRODUCT_BLOCK" ]; then
-  PRODUCT_STORAGE=$(df /product 2>/dev/null | tail -1 | tr -s ' ' | cut -d ' ' -f4)
+if [ -n "$PRODUCT_MNT" ]; then
+  PRODUCT_STORAGE=$(df "$PRODUCT_MNT" 2>/dev/null | tail -1 | tr -s ' ' | cut -d ' ' -f4)
   if [ -n "$PRODUCT_STORAGE" ] && [ "$PRODUCT_STORAGE" -lt "$STORAGE_BUFFER" ]; then
     error_no_space
   fi
@@ -198,16 +187,17 @@ cat addon.d/addond_tail >> addon.d/70-catshare.sh
 rm -f addon.d/addond_head addon.d/addond_tail
 
 ui_print "Removing old CatShare instances..."
+if [ -n "$PRODUCT_MNT" ]; then
+  rm -rf  "${PRODUCT_MNT}/priv-app/CatShare"
+  rm -f   "${PRODUCT_MNT}/etc/permissions/privapp-permissions-catshare.xml"
+fi
+# Also clean up any old install in system/product in case it ended up there before
 rm -rf "${SYSTEM_OUT}/product/priv-app/CatShare"
 rm -rf "${SYSTEM_OUT}/priv-app/CatShare"
-rm -f "${SYSTEM_OUT}/product/etc/permissions/privapp-permissions-catshare.xml"
-rm -f "${SYSTEM_OUT}/etc/permissions/privapp-permissions-catshare.xml"
-if [ -n "$PRODUCT_BLOCK" ]; then
-  rm -rf "/product/priv-app/CatShare"
-  rm -f "/product/etc/permissions/privapp-permissions-catshare.xml"
-fi
+rm -f  "${SYSTEM_OUT}/product/etc/permissions/privapp-permissions-catshare.xml"
+rm -f  "${SYSTEM_OUT}/etc/permissions/privapp-permissions-catshare.xml"
 
-ui_print "Preparing permissions..."
+ui_print "Preparing file permissions..."
 for d in $(find . -mindepth 1 -type d); do
   set_perm 0755 "$d"
   set_owner root root "$d"
@@ -224,9 +214,22 @@ for f in $(find . -type f); do
 done
 
 ui_print "Copying CatShare files..."
-cp --preserve=a -r ./* "${SYSTEM_OUT}/"
-if [ -n "$PRODUCT_BLOCK" ]; then
-  cp --preserve=a -r ./product/* /product/
+if [ -n "$PRODUCT_MNT" ]; then
+  # Copy product-specific files directly to the mounted product partition
+  ui_print "  -> /mnt/product (dedicated product partition)"
+  mkdir -p "${PRODUCT_MNT}/priv-app/CatShare"
+  mkdir -p "${PRODUCT_MNT}/etc/permissions"
+  cp --preserve=a product/priv-app/CatShare/CatShare.apk \
+                   "${PRODUCT_MNT}/priv-app/CatShare/CatShare.apk"
+  cp --preserve=a product/etc/permissions/privapp-permissions-catshare.xml \
+                   "${PRODUCT_MNT}/etc/permissions/privapp-permissions-catshare.xml"
+  # Copy addon.d script into system
+  mkdir -p "${SYSTEM_OUT}/addon.d"
+  cp --preserve=a addon.d/70-catshare.sh "${SYSTEM_OUT}/addon.d/70-catshare.sh"
+else
+  # No separate product partition: write everything under system/product
+  ui_print "  -> ${SYSTEM_OUT} (integrated product)"
+  cp --preserve=a -r ./* "${SYSTEM_OUT}/"
 fi
 
 cleanup

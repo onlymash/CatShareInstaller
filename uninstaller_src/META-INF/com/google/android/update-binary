@@ -14,9 +14,8 @@ cleanup() {
   rm -f "$TMP/toybox"
 
   ui_print "Unmounting partitions..."
+  umount -l /mnt/product 2>/dev/null || true
   umount -l "$SYSTEM_MNT" 2>/dev/null || true
-  umount -l /product 2>/dev/null || true
-  umount -l /system_ext 2>/dev/null || true
 }
 
 get_block_for_mount_point() {
@@ -72,9 +71,8 @@ if [ -f "$TOYBOX" ]; then
 fi
 
 ui_print "Mounting partitions..."
+umount /mnt/product 2>/dev/null || true
 umount /system 2>/dev/null || umount /mnt/system 2>/dev/null || true
-umount /product 2>/dev/null || true
-umount /system_ext 2>/dev/null || true
 
 DYNAMIC_PARTITIONS=$(getprop ro.boot.dynamic_partitions)
 if [ "$DYNAMIC_PARTITIONS" = "true" ]; then
@@ -116,33 +114,33 @@ else
   SYSTEM_OUT="${SYSTEM_MNT}"
 fi
 
-if [ -L "${SYSTEM_MNT}/product" ] || [ -L "${SYSTEM_OUT}/product" ]; then
-  PRODUCT_BLOCK=""
-fi
-
+# Mount product partition to /mnt/product (always, even if symlinked inside system)
+PRODUCT_MNT=""
 if [ -n "$PRODUCT_BLOCK" ]; then
-  mkdir /product 2>/dev/null || true
-  mount -o rw "$PRODUCT_BLOCK" /product 2>/dev/null || PRODUCT_BLOCK=""
+  mkdir -p /mnt/product 2>/dev/null || true
+  if mount -o rw "$PRODUCT_BLOCK" /mnt/product; then
+    ui_print "Mounted product: /mnt/product"
+    PRODUCT_MNT=/mnt/product
+  fi
 fi
 
 ui_print "Removing CatShare application files..."
-# 1. Remove priv-app and permissions in system
+# 1. Remove from dedicated product partition mount point
+if [ -n "$PRODUCT_MNT" ]; then
+  rm -rf "${PRODUCT_MNT}/priv-app/CatShare"
+  rm -f  "${PRODUCT_MNT}/etc/permissions/privapp-permissions-catshare.xml"
+fi
+
+# 2. Also clean up any stale copies in system/product directory
 rm -rf "${SYSTEM_OUT}/product/priv-app/CatShare"
 rm -rf "${SYSTEM_OUT}/priv-app/CatShare"
-rm -f "${SYSTEM_OUT}/product/etc/permissions/privapp-permissions-catshare.xml"
-rm -f "${SYSTEM_OUT}/etc/permissions/privapp-permissions-catshare.xml"
-
-# 2. Remove in standalone product partition
-if [ -n "$PRODUCT_BLOCK" ]; then
-  rm -rf "/product/priv-app/CatShare"
-  rm -f "/product/etc/permissions/privapp-permissions-catshare.xml"
-fi
+rm -f  "${SYSTEM_OUT}/product/etc/permissions/privapp-permissions-catshare.xml"
+rm -f  "${SYSTEM_OUT}/etc/permissions/privapp-permissions-catshare.xml"
 
 # 3. Remove addon.d survival scripts
 ui_print "Removing addon.d survival scripts..."
 rm -f "${SYSTEM_OUT}/addon.d/70-catshare.sh"
 rm -f "${SYSTEM_MNT}/addon.d/70-catshare.sh"
-rm -f /tmp/addon.d/70-catshare.sh 2>/dev/null || true
 
 cleanup
 
