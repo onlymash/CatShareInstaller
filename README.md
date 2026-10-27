@@ -79,10 +79,6 @@ LineageOS 自带的 `backuptool.sh` 机制会在更新时执行 `/system/addon.d
 
 ---
 
-## 🔄 后续升级 CatShare APK 与项目维护
-
-本项目完全独立自治，不再依赖任何外部的 MindTheGapps 参考目录（你可以安全删除它）。
-
 ### 升级 APK 步骤：
 1. 用新版本的 APK 替换根目录的 `catshare.apk`。
 2. 运行打包脚本：
